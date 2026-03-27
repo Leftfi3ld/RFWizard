@@ -1,0 +1,87 @@
+Marauder PCAP Dashboard
+    with get_db() as conn:
+        conn.executemany(
+            """
+            INSERT INTO wifi_events (
+                import_id, file_name, frame_number, frame_time, epoch_time,
+                frame_type, subtype, ta, sa, da, ra, bssid, ssid,
+                channel, frequency, signal_dbm, privacy, akm, cipher,
+                manufacturer, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+
+def query_one(sql: str):
+    with get_db() as conn:
+        return conn.execute(sql).fetchone()[0]
+
+
+def query_all(sql: str):
+    with get_db() as conn:
+        return conn.execute(sql).fetchall()
+
+
+@app.route("/")
+def index():
+    metrics = {
+        "total_events": query_one("SELECT COUNT(*) FROM wifi_events"),
+        "unique_ssids": query_one("SELECT COUNT(DISTINCT NULLIF(ssid, '')) FROM wifi_events"),
+        "unique_bssids": query_one("SELECT COUNT(DISTINCT NULLIF(bssid, '')) FROM wifi_events"),
+        "unique_stations": query_one("SELECT COUNT(DISTINCT NULLIF(sa, '')) FROM wifi_events"),
+        "total_imports": query_one("SELECT COUNT(*) FROM imports"),
+    }
+    imports = query_all("SELECT * FROM imports ORDER BY id DESC LIMIT 10")
+    ssids = query_all("SELECT ssid, COUNT(*) AS cnt FROM wifi_events GROUP BY ssid ORDER BY cnt DESC LIMIT 15")
+    stations = query_all("SELECT sa, COUNT(*) AS cnt FROM wifi_events WHERE sa != '' GROUP BY sa ORDER BY cnt DESC LIMIT 15")
+    return render_template_string(TEMPLATE, metrics=metrics, imports=imports, ssids=ssids, stations=stations)
+
+
+@app.route("/import", methods=["POST"])
+def import_pcap():
+    if not tshark_exists():
+        return "tshark is not installed. Run: sudo apt install tshark python3-flask", 500
+
+    uploaded = request.files.get("pcap_file")
+    if not uploaded or not uploaded.filename:
+        return "No file selected", 400
+
+    notes = request.form.get("notes", "").strip()
+    dest = UPLOAD_DIR / uploaded.filename
+    uploaded.save(dest)
+
+    import_id = insert_import(uploaded.filename, dest.stat().st_size, notes)
+    events = extract_with_tshark(dest)
+    insert_events(import_id, uploaded.filename, events)
+
+    return redirect(url_for("index"))
+
+
+@app.route("/export/events.csv")
+def export_events():
+    export_path = EXPORT_DIR / "events.csv"
+    with get_db() as conn, export_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "id", "import_id", "file_name", "frame_number", "frame_time", "epoch_time",
+            "frame_type", "subtype", "ta", "sa", "da", "ra", "bssid", "ssid",
+            "channel", "frequency", "signal_dbm", "privacy", "akm", "cipher", "manufacturer"
+        ])
+        rows = conn.execute(
+            """
+            SELECT id, import_id, file_name, frame_number, frame_time, epoch_time,
+                   frame_type, subtype, ta, sa, da, ra, bssid, ssid,
+                   channel, frequency, signal_dbm, privacy, akm, cipher, manufacturer
+            FROM wifi_events
+            ORDER BY id ASC
+            """
+        )
+        writer.writerows(rows)
+    return send_file(export_path, as_attachment=True)
+
+
+if __name__ == "__main__":
+    init_db()
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="127.0.0.1", port=port, debug=True)
